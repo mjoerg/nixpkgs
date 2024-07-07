@@ -2,11 +2,12 @@
   stdenv,
   fetchFromGitHub,
   fetchpatch,
+  applyPatches,
   libuuid,
   bc,
   lib,
   buildPackages,
-  nix-update-script,
+  writeScript,
 }:
 
 let
@@ -28,24 +29,11 @@ let
 
   buildType = if stdenv.isDarwin then "CLANGPDB" else "GCC5";
 
-
   edk2 = stdenv.mkDerivation {
     pname = "edk2";
     version = "202405";
 
-    patches = [
-      # pass targetPrefix as an env var
-      (fetchpatch {
-        url = "https://src.fedoraproject.org/rpms/edk2/raw/08f2354cd280b4ce5a7888aa85cf520e042955c3/f/0021-Tweak-the-tools_def-to-support-cross-compiling.patch";
-        hash = "sha256-E1/fiFNVx0aB1kOej2DJ2DlBIs9tAAcxoedym2Zhjxw=";
-      })
-      # https://github.com/tianocore/edk2/pull/5658
-      (fetchpatch {
-        url = "https://github.com/tianocore/edk2/commit/a34ff4a8f69a7b8a52b9b299153a8fac702c7df1.patch";
-        hash = "sha256-u+niqwjuLV5tNPykW4xhb7PW2XvUmXhx5uvftG1UIbU=";
-      })
-    ];
-    src = fetchFromGitHub {
+    srcWithVendoring = fetchFromGitHub {
       owner = "tianocore";
       repo = "edk2";
       rev = "edk2-stable${edk2.version}";
@@ -53,18 +41,36 @@ let
       hash = "sha256-+phKAr3xc4T8tg6YAoGgRWCmxZiFzhazEAai48ICnKM=";
     };
 
-    postPatch = ''
-      # We don't want EDK2 to keep track of OpenSSL,
-      # they're frankly bad at it.
-      rm -r CryptoPkg/Library/OpensslLib/openssl
-      mkdir -p CryptoPkg/Library/OpensslLib/openssl
-      tar --strip-components=1 -xf ${buildPackages.openssl.src} -C CryptoPkg/Library/OpensslLib/openssl
+    src = applyPatches {
+      name = "edk2-unvendored-src";
+      src = edk2.srcWithVendoring;
 
-      # Fix missing INT64_MAX include that edk2 explicitly does not provide
-      # via it's own <stdint.h>. Let's pull in openssl's definition instead:
-      sed -i CryptoPkg/Library/OpensslLib/openssl/crypto/property/property_parse.c \
-          -e '1i #include "internal/numbers.h"'
-    '';
+      patches = [
+        # pass targetPrefix as an env var
+        (fetchpatch {
+          url = "https://src.fedoraproject.org/rpms/edk2/raw/08f2354cd280b4ce5a7888aa85cf520e042955c3/f/0021-Tweak-the-tools_def-to-support-cross-compiling.patch";
+          hash = "sha256-E1/fiFNVx0aB1kOej2DJ2DlBIs9tAAcxoedym2Zhjxw=";
+        })
+        # https://github.com/tianocore/edk2/pull/5658
+        (fetchpatch {
+          url = "https://github.com/tianocore/edk2/commit/a34ff4a8f69a7b8a52b9b299153a8fac702c7df1.patch";
+          hash = "sha256-u+niqwjuLV5tNPykW4xhb7PW2XvUmXhx5uvftG1UIbU=";
+        })
+      ];
+
+      postPatch = ''
+        # We don't want EDK2 to keep track of OpenSSL,
+        # they're frankly bad at it.
+        rm -r CryptoPkg/Library/OpensslLib/openssl
+        mkdir -p CryptoPkg/Library/OpensslLib/openssl
+        tar --strip-components=1 -xf ${buildPackages.openssl.src} -C CryptoPkg/Library/OpensslLib/openssl
+
+        # Fix missing INT64_MAX include that edk2 explicitly does not provide
+        # via it's own <stdint.h>. Let's pull in openssl's definition instead:
+        sed -i CryptoPkg/Library/OpensslLib/openssl/crypto/property/property_parse.c \
+            -e '1i #include "internal/numbers.h"'
+      '';
+    };
 
     nativeBuildInputs = [ pythonEnv ];
     depsBuildBuild = [
@@ -102,16 +108,28 @@ let
 
     enableParallelBuilding = true;
 
-    meta = with lib; {
+    meta = {
       description = "Intel EFI development kit";
       homepage = "https://github.com/tianocore/tianocore.github.io/wiki/EDK-II/";
       changelog = "https://github.com/tianocore/edk2/releases/tag/edk2-stable${edk2.version}";
-      license = licenses.bsd2;
-      platforms = with platforms; aarch64 ++ arm ++ i686 ++ x86_64 ++ riscv64;
+      license = lib.licenses.bsd2;
+      platforms = with lib.platforms; aarch64 ++ arm ++ i686 ++ x86_64 ++ riscv64;
     };
 
     passthru = {
-      updateScript = nix-update-script { };
+      updateScript = writeScript "update-edk2" ''
+        #!/usr/bin/env nix-shell
+        #!nix-shell -i bash -p common-updater-scripts coreutils gnused
+        set -eu -o pipefail
+        version="$(list-git-tags --url="${edk2.srcWithVendoring.url}" |
+                   sed -E --quiet 's/^edk2-stable([0-9]{6})$/\1/p' |
+                   sort --reverse --numeric-sort |
+                   head -n 1)"
+        if [[ "x$UPDATE_NIX_OLD_VERSION" != "x$version" ]]; then
+            update-source-version --source-key=srcWithVendoring \
+                "$UPDATE_NIX_ATTR_PATH" "$version"
+        fi
+      '';
 
       mkDerivation =
         projectDscPath: attrsOrFun:
